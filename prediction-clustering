@@ -1,0 +1,142 @@
+#=======================================================================================================
+#FOGG
+#======================================================================================================
+# import library
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, least, split, concat_ws
+import pyspark.sql.functions as f
+from pyspark.sql.functions import lit
+import pandas as pd
+from pyspark.ml.linalg import Vectors
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.feature import StandardScaler
+import numpy as np
+from pyspark.ml.clustering import KMeansModel
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import udf
+import math as m
+from pyspark.ml.fpm import FPGrowth
+from pyspark.sql.functions import countDistinct
+
+# create spark session
+appName = "prediction_fogg_monthly"
+master = "yarn"
+
+# Create Spark session with Hive supported.
+spark = (
+    SparkSession.builder.appName(appName)
+    .master(master)
+    .enableHiveSupport()
+    .getOrCreate()
+)
+
+#df=spark.sql("""SELECT  * FROM db_intensifikasi.datamart_fogg """)
+df=spark.sql("""SELECT  cif_latest	cif_latest,
+mobile_phone mobile_phone,	
+freq_trx_out_last3m	freq_trx_out_last3m,	
+amt_trx_out_last3m	amt_trx_out_last3m,	
+freq_trx_in_last3m	freq_trx_in_last3m	,
+amt_trx_in_last3m	amt_trx_in_last3m,
+freq_trx_nonmb_last3m freq_trx_nonmb_last3m,
+amt_trx_nonmb_last3m	amt_trx_nonmb_last3m,
+freq_activity_value_3m	freq_activity_value_3m,
+freq_activity_nonvalue_3m	freq_activity_nonvalue_3m	,
+account_avg_bal_30days	account_avg_bal_30days,	
+account_mtd_avg_bal_60days	account_mtd_avg_bal_60days	,	
+account_avg_bal_90days	account_avg_bal_90days	,
+total_account	total_account	,
+total_product	total_product	,
+cust_location	cust_location	,
+age	age	,
+customer_since	customer_since	,
+msm_since	msm_since	
+FROM db_intensifikasi.datamart_fogg""")
+
+#fillna
+df=df.na.fill(0)
+
+# generate attribute
+from pyspark.sql.functions import col
+df=df.withColumn("amt_overall", (col("amt_trx_nonmb_last3m"))+(col("amt_trx_out_last3m"))+(col("amt_trx_in_last3m")))
+
+#prep balance(if balance<0 then 0)
+from pyspark.sql.functions import when
+df = df.withColumn('account_avg_bal_90days', \
+              when(df['account_avg_bal_90days'] < 0, 0).otherwise(df["account_avg_bal_90days"]))
+			  
+#df.show()			  
+
+#DATA TRANSFORMATION (log Transformation)
+
+df = df.withColumn("amt_overall_scaled", f.log10(f.col('amt_overall') + lit(1)))
+df = df.withColumn("freq_trx_nonmb_last3m_scaled", f.log10(f.col('freq_trx_nonmb_last3m') + lit(1)))
+df = df.withColumn("freq_activity_nonvalue_3m_scaled", f.log10(f.col('freq_activity_nonvalue_3m') + lit(1)))
+df = df.withColumn("account_avg_bal_90days_scaled", f.log10(f.col('account_avg_bal_90days') + lit(1)))
+#df.show()
+
+#Format the Data to vector
+from pyspark.sql.functions import col
+vec_assembler = VectorAssembler(inputCols = ("amt_overall_scaled","freq_trx_nonmb_last3m_scaled","freq_activity_nonvalue_3m_scaled","account_avg_bal_90days_scaled"), outputCol='features') 
+final_data = vec_assembler.transform(df)
+
+
+#transform data
+scaler = StandardScaler(inputCol="features", outputCol="scaledFeatures", withStd=True, withMean=True)
+
+# Compute summary statistics by fitting the StandardScaler
+scalerModel = scaler.fit(final_data)
+
+# Normalize each feature to have unit standard deviation and mean.
+final_data = scalerModel.transform(final_data)
+
+#read model 
+mPath = "model_fogg"
+persistedModelFogg = KMeansModel.load(mPath)
+
+# predict for new data
+predictions = persistedModelFogg.transform(final_data)
+
+#SUMMARY
+#import pyspark.sql.functions as f
+#summary_fogg=predictions.groupBy("prediction") \
+#.agg (f.count("cif_latest").alias("count nasabah"),
+#f.mean("freq_trx_out_last3m").alias("freq_trx_out_last3m"), \
+#f.mean("amt_trx_out_last3m").alias('amt_trx_out_last3m'),\
+#f.mean("amt_trx_nonmb_last3m").alias('amt_trx_nonmb_3m'),\
+#f.mean("amt_trx_in_last3m").alias('amt_trx_in_last3m'),\
+#f.mean("freq_trx_in_last3m").alias('freq_trx_in_last3m'),\
+#f.mean("freq_trx_nonmb_last3m").alias('freq_trx_nonmb_last3m'),\
+#f.mean("amt_trx_nonmb_last3m").alias('amt_trx_nonmb_last3m'),\
+#f.mean("account_avg_bal_30days").alias('account_avg_bal_30days'),\
+#f.mean("account_mtd_avg_bal_60days").alias('account_mtd_avg_bal_60days'),\
+#f.mean("account_avg_bal_90days").alias('account_avg_bal_90days'),\
+#f.mean("total_account").alias('total_account'),\
+#f.mean("total_product").alias('total_product'),\
+#f.mean("freq_activity_value_3m").alias('freq_activity_value_3m'), \
+#f.mean("freq_activity_nonvalue_3m").alias('freq_activity_nonvalue_3m'),\
+#f.mean("amt_overall").alias('amt_overall'),\
+#)\
+#.show(truncate=False)         
+
+#define grouping new cluster
+from pyspark.sql.functions import when,col
+predictions= predictions.withColumn("fogg_segment", when(predictions.prediction == "0","high ability, low motivation")
+								 .when(predictions.prediction == "1","low ability, low motivation")
+								 .when(predictions.prediction == "2","high ability, high motivation")
+								 .when(predictions.prediction == "3","high ability, high motivation")
+								 .when(predictions.prediction == "4","low ability, high motivation")
+								 .when(predictions.prediction == "5","high ability, high motivation")
+								 )
+                                                            
+#predictions.groupBy('segment_fogg').agg({'prediction':'count'}).show()
+                                                           
+#drop columns
+predictions_fogg=predictions.drop('amt_overall_scaled', 'freq_trx_nonmb_last3m_scaled','freq_activity_nonvalue_3m_scaled',"account_avg_bal_90days_scaled",'features','scaledFeatures')
+
+#add batch_date
+predictions_fogg= predictions_fogg.withColumn("batch_date", date_format(last_day(add_months(current_date(), -1)), 'yyyy-MM-dd')) #-1 previous month
+
+#export predictions2 to hive table
+predictions_fogg.write.mode("append").partitionBy('batch_date').format("parquet").saveAsTable("db_intensifikasi.prediction_fogg")
+#predictions_fogg.write.mode("overwrite").partitionBy('batch_date').format("parquet").saveAsTable("db_intensifikasi.prediction_fogg")
